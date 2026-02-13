@@ -1,0 +1,49 @@
+{
+  "meta": {
+    "user_id": "u_12345",
+    "session_id": "s_67890",
+    "created_at": "2026-02-12T10:00:00"
+  },
+  "hard_constraints": {
+    "date": "2026-05-01",
+    "duration_days": 1,
+    "start_point": {
+      "name": "五道口地铁站",
+      "location": [116.338, 39.993] 
+    },
+    "end_point": { 
+      "type": "same_as_start"
+    },
+    "transport_mode": "driving", 
+    "distribution": {
+      "morning": 2,  
+      "afternoon": 2, 
+      "evening": 1   
+    }
+  },
+  "soft_preferences": {
+    "pace": "relaxed", 
+    "budget_level": 3, 
+    "interests": [
+      {
+        "type": "sight",
+        "level": "strict", 
+        "category_constraint": {
+           "major": "110000", 
+           "middle": "110100", 
+           "specific_name": null 
+        }
+      },
+      {
+        "type": "dining",
+        "meal": "lunch",
+        "category_constraint": {
+           "major": "050000",
+           "middle": "050100", 
+           "small": "050102"   
+        }
+      }
+    ],
+    "negative_keywords": ["博物馆", "爬山"] 
+  }
+}
