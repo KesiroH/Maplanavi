@@ -19,17 +19,39 @@
 
 使用前请确保:
 1. 在高德开放平台 (https://lbs.amap.com/) 申请 Web 服务 Key。
-2. 安装 requests 库: `pip install requests`
+2. 设置环境变量 AMAP_API_KEY 或在代码中传入配置。
+3. 安装依赖: `pip install requests pydantic tenacity`
 """
 
-import requests
+from __future__ import annotations
+
 import json
 import logging
+import os
 import time
-from typing import Optional, Dict, Any, List, Union
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple, Union
 
+import requests
+
+from .models import (
+    AmapConfig,
+    AmapDistance,
+    AmapDistrict,
+    AmapLocation,
+    AmapPOI,
+    AmapRoute,
+    CoordinateSystem,
+)
+from .coordinate_utils import (
+    convert_coordinate,
+    detect_coordinate_system,
+    ensure_gcj02,
+    ensure_wgs84,
+    gcj02_to_wgs84,
+    wgs84_to_gcj02,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,6 +75,11 @@ class GaodeMapError(Exception):
         self.response = response
         super().__init__(self.message)
 
+    def __str__(self) -> str:
+        if self.info_code:
+            return f"{self.message} (code: {self.info_code})"
+        return self.message
+
 
 class GaodeMapConnectionError(GaodeMapError):
     """网络连接错误"""
@@ -66,6 +93,16 @@ class GaodeMapAPIError(GaodeMapError):
 
 class GaodeMapTimeoutError(GaodeMapError):
     """请求超时错误"""
+    pass
+
+
+class GaodeMapConfigError(GaodeMapError):
+    """配置错误"""
+    pass
+
+
+class GaodeMapCoordinateError(GaodeMapError):
+    """坐标系错误"""
     pass
 
 
@@ -151,25 +188,93 @@ class GaodeMapClient:
         "30010": "服务端服务不可用",
     }
 
-    def __init__(self, api_key: str, timeout: int = 10, max_retries: int = 3, retry_delay: float = 1.0):
+    RETRYABLE_ERRORS = {
+        "10002", "10003", "10004", "10005",
+        "30001", "30002", "30003", "30004", "30005", "30006", "30007", "30008", "30009", "30010"
+    }
+
+    def __init__(
+        self,
+        api_key: Optional[str] = "a1fd193c9a05059c48dea35bd2f8a287",
+        config: Optional[AmapConfig] = None,
+        timeout: int = 10,
+        max_retries: int = 3,
+        retry_delay: float = 1.0,
+    ):
         """
         初始化客户端
 
+        优先级: config > api_key参数 > 环境变量
+
         Args:
-            api_key (str): 高德地图 Web 服务 API Key
+            api_key (str, optional): 高德地图 Web 服务 API Key
+            config (AmapConfig, optional): 配置对象，优先级最高
             timeout (int): 请求超时时间（秒），默认10秒
             max_retries (int): 最大重试次数，默认3次
             retry_delay (float): 重试间隔（秒），默认1秒
-        """
-        self.api_key = api_key
-        self.timeout = timeout
-        self.max_retries = max_retries
-        self.retry_delay = retry_delay
-        logger.info("GaodeMapClient initialized with timeout=%ds, max_retries=%d", timeout, max_retries)
 
-    def _make_request(self, endpoint: str, params: Dict[str, Any], method: str = "GET") -> Dict[str, Any]:
+        Raises:
+            GaodeMapConfigError: 未提供有效的 API Key
         """
-        发送 HTTP 请求到高德 API
+        if config is not None:
+            self._config = config
+        elif api_key is not None:
+            self._config = AmapConfig(
+                api_key=api_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                retry_delay=retry_delay,
+            )
+        else:
+            try:
+                self._config = AmapConfig.from_env(
+                    timeout=timeout,
+                    max_retries=max_retries,
+                    retry_delay=retry_delay,
+                )
+            except ValueError as e:
+                raise GaodeMapConfigError(
+                    f"未提供有效的 API Key。请设置环境变量 AMAP_API_KEY 或传入 api_key 参数。错误: {e}"
+                )
+
+        self.api_key = self._config.api_key
+        self.timeout = self._config.timeout
+        self.max_retries = self._config.max_retries
+        self.retry_delay = self._config.retry_delay
+
+        self._request_count = 0
+        self._last_request_time: Optional[float] = None
+
+        logger.info(
+            "GaodeMapClient initialized: timeout=%ds, max_retries=%d, retry_delay=%.1fs",
+            self.timeout, self.max_retries, self.retry_delay
+        )
+
+    @property
+    def config(self) -> AmapConfig:
+        """获取当前配置"""
+        return self._config
+
+    @property
+    def request_stats(self) -> Dict[str, Any]:
+        """获取请求统计信息"""
+        return {
+            "total_requests": self._request_count,
+            "last_request_time": self._last_request_time,
+        }
+
+    def _exponential_backoff(self, attempt: int) -> float:
+        """计算指数退避时间"""
+        return min(self.retry_delay * (2 ** attempt), 60.0)
+
+    def _make_request(
+        self,
+        endpoint: str,
+        params: Dict[str, Any],
+        method: str = "GET"
+    ) -> Dict[str, Any]:
+        """
+        发送 HTTP 请求到高德 API（带指数退避重试）
 
         Args:
             endpoint (str): API 端点，例如 "/v3/geocode/geo"
@@ -197,6 +302,9 @@ class GaodeMapClient:
         last_exception = None
         for attempt in range(self.max_retries):
             try:
+                self._request_count += 1
+                self._last_request_time = time.time()
+
                 if method.upper() == "GET":
                     response = requests.get(url, params=all_params, timeout=self.timeout)
                 else:
@@ -214,6 +322,16 @@ class GaodeMapClient:
                 if status != "1":
                     error_msg = self.ERROR_CODES.get(info_code, info)
                     logger.error("API error: %s (infocode: %s)", error_msg, info_code)
+
+                    if info_code in self.RETRYABLE_ERRORS and attempt < self.max_retries - 1:
+                        backoff_time = self._exponential_backoff(attempt)
+                        logger.warning(
+                            "Retryable error, retrying in %.1fs (attempt %d/%d)",
+                            backoff_time, attempt + 1, self.max_retries
+                        )
+                        time.sleep(backoff_time)
+                        continue
+
                     raise GaodeMapAPIError(
                         message=f"高德 API 调用失败: {error_msg}",
                         info_code=info_code,
@@ -245,7 +363,9 @@ class GaodeMapClient:
                 logger.warning("Request error, attempt %d/%d", attempt + 1, self.max_retries)
             
             if attempt < self.max_retries - 1:
-                time.sleep(self.retry_delay)
+                backoff_time = self._exponential_backoff(attempt)
+                logger.info("Retrying in %.1fs...", backoff_time)
+                time.sleep(backoff_time)
         
         logger.error("All retry attempts failed for %s", endpoint)
         raise last_exception
@@ -259,64 +379,131 @@ class GaodeMapClient:
             data=data
         )
 
-    # ======================
-    # 地理/逆地理编码
-    # ======================
+    def _parse_coordinate(self, location: str) -> Tuple[float, float]:
+        """解析坐标字符串 '经度,纬度'"""
+        parts = location.split(",")
+        if len(parts) != 2:
+            raise GaodeMapCoordinateError(f"无效的坐标格式: {location}")
+        return float(parts[0]), float(parts[1])
 
-    def geocode(self, address: str, city: Optional[str] = None) -> Dict[str, Any]:
+    def _validate_and_convert_coordinate(
+        self,
+        lng: float,
+        lat: float,
+        source_sys: Optional[CoordinateSystem] = None,
+        target_sys: CoordinateSystem = CoordinateSystem.GCJ02
+    ) -> Tuple[float, float]:
+        """
+        验证并转换坐标系
+
+        Args:
+            lng: 经度
+            lat: 纬度
+            source_sys: 源坐标系（可选，自动检测）
+            target_sys: 目标坐标系（默认 GCJ-02，高德使用）
+
+        Returns:
+            Tuple[float, float]: 转换后的坐标
+        """
+        if not (-180 <= lng <= 180):
+            raise GaodeMapCoordinateError(f"经度超出有效范围: {lng}")
+        if not (-90 <= lat <= 90):
+            raise GaodeMapCoordinateError(f"纬度超出有效范围: {lat}")
+
+        if source_sys is None:
+            source_sys = detect_coordinate_system(lat, lng)
+
+        if source_sys == target_sys:
+            return lng, lat
+
+        return convert_coordinate(lng, lat, source_sys, target_sys)
+
+    def audit_coordinate(
+        self,
+        lng: float,
+        lat: float,
+        expected_sys: CoordinateSystem = CoordinateSystem.GCJ02
+    ) -> Dict[str, Any]:
+        """
+        审查坐标信息
+
+        Args:
+            lng: 经度
+            lat: 纬度
+            expected_sys: 期望的坐标系
+
+        Returns:
+            dict: 包含坐标系检测结果和转换建议
+        """
+        detected_sys = detect_coordinate_system(lat, lng)
+        needs_conversion = detected_sys != expected_sys
+
+        result = {
+            "input": {"longitude": lng, "latitude": lat},
+            "detected_system": detected_sys.value,
+            "expected_system": expected_sys.value,
+            "needs_conversion": needs_conversion,
+        }
+
+        if needs_conversion:
+            converted_lng, converted_lat = convert_coordinate(lng, lat, detected_sys, expected_sys)
+            result["converted"] = {"longitude": converted_lng, "latitude": converted_lat}
+
+        return result
+
+    def geocode(
+        self,
+        address: str,
+        city: Optional[str] = None,
+        return_model: bool = True
+    ) -> Union[Dict[str, Any], List[AmapLocation]]:
         """
         地理编码: 将地址转换为经纬度坐标
 
         文档: https://lbs.amap.com/api/webservice/guide/api/georegeo#1
 
         Args:
-            address (str): 结构化地址或关键词，例如 "北京市朝阳区阜通东大街6号"
-            city (str, optional): 指定查询的城市。可选，但能提高准确性。
+            address (str): 结构化地址或关键词
+            city (str, optional): 指定查询的城市
+            return_model (bool): 是否返回 Pydantic 模型，默认 True
 
         Returns:
-            dict: 包含地理编码结果的字典
-                {
-                    "geocodes": [
-                        {
-                            "location": "116.481499,39.990475",
-                            "province": "北京市",
-                            "city": "北京市",
-                            "citycode": "010",
-                            "district": "朝阳区",
-                            "adcode": "110105",
-                            ...
-                        }
-                    ]
-                }
+            如果 return_model=True: List[AmapLocation]
+            如果 return_model=False: dict
         """
         logger.info("Geocoding address: %s, city: %s", address, city)
         params = {"address": address}
         if city:
             params["city"] = city
 
-        return self._make_request("/v3/geocode/geo", params)
+        data = self._make_request("/v3/geocode/geo", params)
 
-    def reverse_geocode(self, location: str, radius: Optional[int] = None, 
-                       extensions: str = "base") -> Dict[str, Any]:
+        if return_model:
+            geocodes = data.get("geocodes", [])
+            return [AmapLocation.from_amap_geocode(gc) for gc in geocodes]
+        return data
+
+    def reverse_geocode(
+        self,
+        location: str,
+        radius: Optional[int] = None,
+        extensions: str = "base",
+        return_model: bool = True
+    ) -> Union[Dict[str, Any], AmapLocation]:
         """
         逆地理编码: 将经纬度坐标转换为地址描述
 
         文档: https://lbs.amap.com/api/webservice/guide/api/georegeo#2
 
         Args:
-            location (str): 经纬度坐标，格式 "经度,纬度"，例如 "116.481499,39.990475"
-            radius (int, optional): 查询半径（米），默认1000米。
-            extensions (str): 返回结果控制。"base"（基本地址信息）或 "all"（包含附近POI列表）。
+            location (str): 经纬度坐标，格式 "经度,纬度"
+            radius (int, optional): 查询半径（米）
+            extensions (str): 返回结果控制。"base" 或 "all"
+            return_model (bool): 是否返回 Pydantic 模型，默认 True
 
         Returns:
-            dict: 包含逆地理编码结果的字典
-                {
-                    "regeocode": {
-                        "formatted_address": "北京市朝阳区望京街与阜通东大街交叉口",
-                        "addressComponent": {...},
-                        "pois": [...] # 仅当 extensions="all" 时存在
-                    }
-                }
+            如果 return_model=True: AmapLocation
+            如果 return_model=False: dict
         """
         logger.info("Reverse geocoding location: %s, extensions: %s", location, extensions)
         params = {
@@ -326,21 +513,34 @@ class GaodeMapClient:
         if radius is not None:
             params["radius"] = str(radius)
 
-        return self._make_request("/v3/geocode/regeo", params)
+        data = self._make_request("/v3/geocode/regeo", params)
 
-    def batch_reverse_geocode(self, locations: List[str], 
-                              extensions: str = "base") -> Dict[str, Any]:
+        if return_model:
+            regeocode = data.get("regeocode", {})
+            location_obj = AmapLocation.from_amap_regeocode(regeocode)
+            lng, lat = self._parse_coordinate(location)
+            location_obj.longitude = lng
+            location_obj.latitude = lat
+            return location_obj
+        return data
+
+    def batch_reverse_geocode(
+        self,
+        locations: List[str],
+        extensions: str = "base",
+        return_model: bool = True
+    ) -> Union[Dict[str, Any], List[AmapLocation]]:
         """
-        批量逆地理编码: 将多个经纬度坐标转换为地址描述
-
-        文档: https://lbs.amap.com/api/webservice/guide/api/georegeo#3
+        批量逆地理编码
 
         Args:
-            locations (list): 经纬度坐标列表，每个坐标格式为 "经度,纬度"
-            extensions (str): 返回结果控制。"base" 或 "all"
+            locations (list): 经纬度坐标列表
+            extensions (str): 返回结果控制
+            return_model (bool): 是否返回 Pydantic 模型，默认 True
 
         Returns:
-            dict: 包含批量逆地理编码结果的字典
+            如果 return_model=True: List[AmapLocation]
+            如果 return_model=False: dict
         """
         logger.info("Batch reverse geocoding %d locations", len(locations))
         params = {
@@ -348,36 +548,46 @@ class GaodeMapClient:
             "extensions": extensions,
             "batch": "true"
         }
-        return self._make_request("/v3/geocode/regeo", params)
+        data = self._make_request("/v3/geocode/regeo", params)
 
-    # ======================
-    # 路径规划
-    # ======================
+        if return_model:
+            regeocodes = data.get("regeocodes", [])
+            results = []
+            for i, regeo in enumerate(regeocodes):
+                loc = AmapLocation.from_amap_regeocode(regeo)
+                if i < len(locations):
+                    lng, lat = self._parse_coordinate(locations[i])
+                    loc.longitude = lng
+                    loc.latitude = lat
+                results.append(loc)
+            return results
+        return data
 
-    def driving_direction(self, origin: str, destination: str, 
-                         strategy: int = 10, waypoints: Optional[str] = None,
-                         avoidpolygons: Optional[str] = None, avoidroad: Optional[str] = None) -> Dict[str, Any]:
+    def driving_direction(
+        self,
+        origin: str,
+        destination: str,
+        strategy: int = 10,
+        waypoints: Optional[str] = None,
+        avoidpolygons: Optional[str] = None,
+        avoidroad: Optional[str] = None,
+        return_model: bool = True
+    ) -> Union[Dict[str, Any], AmapRoute]:
         """
         驾车路径规划
 
-        文档: https://lbs.amap.com/api/webservice/guide/api/direction#1
-
         Args:
             origin (str): 起点经纬度，格式 "经度,纬度"
-            destination (str): 终点经纬度，格式 "经度,纬度"
-            strategy (int): 路径计算策略。默认10（速度优先，躲避拥堵）。
-                0: 速度优先（时间）
-                1: 费用优先（不走收费路段的最快道路）
-                2: 距离优先（最短）
-                10: 速度优先（推荐）
-                11: 躲避拥堵
-                12: 躲避拥堵且速度优先
-            waypoints (str, optional): 途经点经纬度，多个用 "|" 分隔
+            destination (str): 终点经纬度
+            strategy (int): 路径计算策略，默认10
+            waypoints (str, optional): 途经点
             avoidpolygons (str, optional): 避让区域
-            avoidroad (str, optional): 避让道路名称
+            avoidroad (str, optional): 避让道路
+            return_model (bool): 是否返回 Pydantic 模型，默认 True
 
         Returns:
-            dict: 包含驾车路线详情的字典
+            如果 return_model=True: AmapRoute
+            如果 return_model=False: dict
         """
         logger.info("Driving direction: %s -> %s, strategy: %d", origin, destination, strategy)
         params = {
@@ -391,71 +601,96 @@ class GaodeMapClient:
             params["avoidpolygons"] = avoidpolygons
         if avoidroad:
             params["avoidroad"] = avoidroad
-        return self._make_request("/v3/direction/driving", params)
 
-    def walking_direction(self, origin: str, destination: str) -> Dict[str, Any]:
+        data = self._make_request("/v3/direction/driving", params)
+
+        if return_model:
+            path = data.get("route", {}).get("paths", [{}])[0]
+            return AmapRoute.from_amap_driving(path)
+        return data
+
+    def walking_direction(
+        self,
+        origin: str,
+        destination: str,
+        return_model: bool = True
+    ) -> Union[Dict[str, Any], AmapRoute]:
         """
         步行路径规划
 
-        文档: https://lbs.amap.com/api/webservice/guide/api/direction#2
-
         Args:
-            origin (str): 起点经纬度，格式 "经度,纬度"
-            destination (str): 终点经纬度，格式 "经度,纬度"
+            origin (str): 起点经纬度
+            destination (str): 终点经纬度
+            return_model (bool): 是否返回 Pydantic 模型，默认 True
 
         Returns:
-            dict: 包含步行路线详情的字典
+            如果 return_model=True: AmapRoute
+            如果 return_model=False: dict
         """
         logger.info("Walking direction: %s -> %s", origin, destination)
         params = {
             "origin": origin,
             "destination": destination
         }
-        return self._make_request("/v3/direction/walking", params)
+        data = self._make_request("/v3/direction/walking", params)
 
-    def bicycling_direction(self, origin: str, destination: str) -> Dict[str, Any]:
+        if return_model:
+            path = data.get("route", {}).get("paths", [{}])[0]
+            return AmapRoute.from_amap_walking(path)
+        return data
+
+    def bicycling_direction(
+        self,
+        origin: str,
+        destination: str,
+        return_model: bool = True
+    ) -> Union[Dict[str, Any], AmapRoute]:
         """
         骑行路径规划
 
-        文档: https://lbs.amap.com/api/webservice/guide/api/direction#3
-
         Args:
-            origin (str): 起点经纬度，格式 "经度,纬度"
-            destination (str): 终点经纬度，格式 "经度,纬度"
+            origin (str): 起点经纬度
+            destination (str): 终点经纬度
+            return_model (bool): 是否返回 Pydantic 模型，默认 True
 
         Returns:
-            dict: 包含骑行路线详情的字典
+            如果 return_model=True: AmapRoute
+            如果 return_model=False: dict
         """
         logger.info("Bicycling direction: %s -> %s", origin, destination)
         params = {
             "origin": origin,
             "destination": destination
         }
-        return self._make_request("/v4/direction/bicycling", params)
+        data = self._make_request("/v4/direction/bicycling", params)
 
-    def transit_direction(self, origin: str, destination: str, 
-                         city: str, cityd: Optional[str] = None,
-                         strategy: int = 0, nightflag: int = 0) -> Dict[str, Any]:
+        if return_model:
+            path = data.get("data", {}).get("paths", [{}])[0]
+            return AmapRoute.from_amap_driving(path)
+        return data
+
+    def transit_direction(
+        self,
+        origin: str,
+        destination: str,
+        city: str,
+        cityd: Optional[str] = None,
+        strategy: int = 0,
+        nightflag: int = 0
+    ) -> Dict[str, Any]:
         """
         公交（公交+地铁）路径规划
 
-        文档: https://lbs.amap.com/api/webservice/guide/api/direction#4
-
         Args:
-            origin (str): 起点经纬度，格式 "经度,纬度"
-            destination (str): 终点经纬度，格式 "经度,纬度"
-            city (str): 起点所在城市（必须提供）
-            cityd (str, optional): 终点所在城市（跨城公交时必填）
-            strategy (int): 换乘策略。默认0（最快捷模式）。
-                0: 最快捷模式
-                1: 最经济模式
-                2: 最少换乘模式
-                3: 最少步行模式
-                5: 不乘地铁模式
-            nightflag (int): 是否计算夜班车。0: 不计算，1: 计算。
+            origin (str): 起点经纬度
+            destination (str): 终点经纬度
+            city (str): 起点所在城市
+            cityd (str, optional): 终点所在城市
+            strategy (int): 换乘策略
+            nightflag (int): 是否计算夜班车
 
         Returns:
-            dict: 包含公交路线详情的字典
+            dict: 公交路线详情
         """
         logger.info("Transit direction: %s -> %s, city: %s", origin, destination, city)
         params = {
@@ -469,30 +704,33 @@ class GaodeMapClient:
             params["cityd"] = cityd
         return self._make_request("/v3/direction/transit/integrated", params)
 
-    # ======================
-    # POI 搜索
-    # ======================
-
-    def poi_search_by_keyword(self, keywords: str, types: Optional[str] = None,
-                              city: Optional[str] = None, citylimit: bool = False,
-                              page: int = 1, offset: int = 20,
-                              extensions: str = "base") -> Dict[str, Any]:
+    def poi_search_by_keyword(
+        self,
+        keywords: str,
+        types: Optional[str] = None,
+        city: Optional[str] = None,
+        citylimit: bool = False,
+        page: int = 1,
+        offset: int = 20,
+        extensions: str = "base",
+        return_model: bool = True
+    ) -> Union[Dict[str, Any], List[AmapPOI]]:
         """
         关键字搜索 POI
 
-        文档: https://lbs.amap.com/api/webservice/guide/api-advanced/newpoisearch#1
-
         Args:
-            keywords (str): 查询关键字，多个关键字用空格分隔
-            types (str, optional): POI 类型，例如 "010000"（美食）。详见高德分类代码表。
+            keywords (str): 查询关键字
+            types (str, optional): POI 类型
             city (str, optional): 查询城市
-            citylimit (bool): 是否限制城市范围内搜索，默认 False
-            page (int): 页码，默认1
-            offset (int): 每页记录数，最大50
-            extensions (str): 返回数据扩展。"base" 或 "all"
+            citylimit (bool): 是否限制城市范围内
+            page (int): 页码
+            offset (int): 每页记录数
+            extensions (str): 返回数据扩展
+            return_model (bool): 是否返回 Pydantic 模型，默认 True
 
         Returns:
-            dict: 包含POI列表的字典
+            如果 return_model=True: List[AmapPOI]
+            如果 return_model=False: dict
         """
         logger.info("POI keyword search: keywords=%s, city=%s, types=%s", keywords, city, types)
         params = {
@@ -507,28 +745,40 @@ class GaodeMapClient:
             params["city"] = city
             params["citylimit"] = "true" if citylimit else "false"
 
-        return self._make_request("/v5/place/text", params)
+        data = self._make_request("/v5/place/text", params)
 
-    def poi_search_around(self, center: str, radius: int = 3000,
-                          keywords: Optional[str] = None, types: Optional[str] = None,
-                          page: int = 1, offset: int = 20,
-                          extensions: str = "base") -> Dict[str, Any]:
+        if return_model:
+            pois = data.get("pois", [])
+            return [AmapPOI.from_amap_poi(poi) for poi in pois]
+        return data
+
+    def poi_search_around(
+        self,
+        center: str,
+        radius: int = 3000,
+        keywords: Optional[str] = None,
+        types: Optional[str] = None,
+        page: int = 1,
+        offset: int = 20,
+        extensions: str = "base",
+        return_model: bool = True
+    ) -> Union[Dict[str, Any], List[AmapPOI]]:
         """
         周边搜索 POI
 
-        文档: https://lbs.amap.com/api/webservice/guide/api-advanced/newpoisearch#2
-
         Args:
-            center (str): 中心点经纬度，格式 "经度,纬度"
-            radius (int): 查询半径（米），最大50000
+            center (str): 中心点经纬度
+            radius (int): 查询半径（米）
             keywords (str, optional): 查询关键字
             types (str, optional): POI 类型
             page (int): 页码
             offset (int): 每页记录数
-            extensions (str): 返回数据扩展。"base" 或 "all"
+            extensions (str): 返回数据扩展
+            return_model (bool): 是否返回 Pydantic 模型，默认 True
 
         Returns:
-            dict: 包含POI列表的字典
+            如果 return_model=True: List[AmapPOI]
+            如果 return_model=False: dict
         """
         logger.info("POI around search: center=%s, radius=%dm, keywords=%s", center, radius, keywords)
         params = {
@@ -543,27 +793,38 @@ class GaodeMapClient:
         if types:
             params["types"] = types
 
-        return self._make_request("/v5/place/around", params)
+        data = self._make_request("/v5/place/around", params)
 
-    def poi_search_by_polygon(self, polygon: str, keywords: Optional[str] = None,
-                              types: Optional[str] = None, page: int = 1, 
-                              offset: int = 20, extensions: str = "base") -> Dict[str, Any]:
+        if return_model:
+            pois = data.get("pois", [])
+            return [AmapPOI.from_amap_poi(poi) for poi in pois]
+        return data
+
+    def poi_search_by_polygon(
+        self,
+        polygon: str,
+        keywords: Optional[str] = None,
+        types: Optional[str] = None,
+        page: int = 1,
+        offset: int = 20,
+        extensions: str = "base",
+        return_model: bool = True
+    ) -> Union[Dict[str, Any], List[AmapPOI]]:
         """
         多边形搜索 POI
 
-        文档: https://lbs.amap.com/api/webservice/guide/api-advanced/newpoisearch#3
-
         Args:
-            polygon (str): 多边形区域坐标，格式 "经度1,纬度1|经度2,纬度2|...|经度n,纬度n"
-                          首尾坐标需相同形成闭合区域
+            polygon (str): 多边形区域坐标
             keywords (str, optional): 查询关键字
             types (str, optional): POI 类型
             page (int): 页码
             offset (int): 每页记录数
-            extensions (str): 返回数据扩展。"base" 或 "all"
+            extensions (str): 返回数据扩展
+            return_model (bool): 是否返回 Pydantic 模型，默认 True
 
         Returns:
-            dict: 包含POI列表的字典
+            如果 return_model=True: List[AmapPOI]
+            如果 return_model=False: dict
         """
         logger.info("POI polygon search: polygon=%s, keywords=%s", polygon[:50] + "...", keywords)
         params = {
@@ -577,59 +838,59 @@ class GaodeMapClient:
         if types:
             params["types"] = types
 
-        return self._make_request("/v5/place/polygon", params)
+        data = self._make_request("/v5/place/polygon", params)
 
-    def poi_search_by_id(self, ids: Union[str, List[str]]) -> Dict[str, Any]:
+        if return_model:
+            pois = data.get("pois", [])
+            return [AmapPOI.from_amap_poi(poi) for poi in pois]
+        return data
+
+    def poi_search_by_id(
+        self,
+        ids: Union[str, List[str]],
+        return_model: bool = True
+    ) -> Union[Dict[str, Any], List[AmapPOI]]:
         """
         ID 查询 POI
 
-        文档: https://lbs.amap.com/api/webservice/guide/api-advanced/newpoisearch#4
-
         Args:
-            ids (str or list): POI ID 或 ID 列表，多个ID用","分隔
+            ids (str or list): POI ID 或 ID 列表
+            return_model (bool): 是否返回 Pydantic 模型，默认 True
 
         Returns:
-            dict: 包含POI详情的字典
+            如果 return_model=True: List[AmapPOI]
+            如果 return_model=False: dict
         """
         if isinstance(ids, list):
             ids = ",".join(ids)
         logger.info("POI ID search: ids=%s", ids)
         params = {"id": ids}
-        return self._make_request("/v5/place/detail", params)
+        data = self._make_request("/v5/place/detail", params)
 
-    # ======================
-    # 距离测量
-    # ======================
+        if return_model:
+            pois = data.get("pois", [])
+            return [AmapPOI.from_amap_poi(poi) for poi in pois]
+        return data
 
-    def distance(self, origins: Union[str, List[str]], destination: str,
-                 distance_type: Union[int, DistanceType] = DistanceType.STRAIGHT) -> Dict[str, Any]:
+    def distance(
+        self,
+        origins: Union[str, List[str]],
+        destination: str,
+        distance_type: Union[int, DistanceType] = DistanceType.STRAIGHT,
+        return_model: bool = True
+    ) -> Union[Dict[str, Any], List[AmapDistance]]:
         """
         距离测量
 
-        文档: https://lbs.amap.com/api/webservice/guide/api/distance
-
         Args:
-            origins (str or list): 起点经纬度，可以是单个坐标或坐标列表
-                单个: "经度,纬度"
-                多个: ["经度1,纬度1", "经度2,纬度2"] 或 "经度1,纬度1|经度2,纬度2"
-            destination (str): 终点经纬度，格式 "经度,纬度"
+            origins (str or list): 起点经纬度
+            destination (str): 终点经纬度
             distance_type (int or DistanceType): 距离测量类型
-                0: 直线距离
-                1: 驾车距离
-                3: 步行距离
+            return_model (bool): 是否返回 Pydantic 模型，默认 True
 
         Returns:
-            dict: 包含距离测量结果的字典
-                {
-                    "results": [
-                        {
-                            "origin_id": "1",
-                            "dest_id": "1",
-                            "distance": "1234",
-                            "duration": "300"
-                        }
-                    ]
-                }
+            如果 return_model=True: List[AmapDistance]
+            如果 return_model=False: dict
         """
         if isinstance(origins, list):
             origins = "|".join(origins)
@@ -646,43 +907,37 @@ class GaodeMapClient:
             "destination": destination,
             "type": str(distance_type)
         }
-        return self._make_request("/v3/distance", params)
+        data = self._make_request("/v3/distance", params)
 
-    # ======================
-    # 行政区划查询
-    # ======================
+        if return_model:
+            results = data.get("results", [])
+            origin_list = origins.split("|")
+            distances = []
+            for i, result in enumerate(results):
+                origin = origin_list[i] if i < len(origin_list) else ""
+                distances.append(AmapDistance.from_amap_distance(result, origin, destination))
+            return distances
+        return data
 
-    def district_query(self, keywords: Optional[str] = None, 
-                       subdistrict: int = 1, 
-                       extensions: str = "base") -> Dict[str, Any]:
+    def district_query(
+        self,
+        keywords: Optional[str] = None,
+        subdistrict: int = 1,
+        extensions: str = "base",
+        return_model: bool = True
+    ) -> Union[Dict[str, Any], AmapDistrict]:
         """
         行政区划查询
 
-        文档: https://lbs.amap.com/api/webservice/guide/api/district
-
         Args:
-            keywords (str, optional): 查询关键字，支持行政区名称、adcode、citycode
-                例如: "北京"、"110000"、"010"
+            keywords (str, optional): 查询关键字
             subdistrict (int): 子级行政区级别
-                0: 不返回下级行政区
-                1: 返回下一级行政区
-                2: 返回下两级行政区
-                3: 返回下三级行政区
-            extensions (str): 返回数据扩展。"base" 或 "all"（包含边界坐标）
+            extensions (str): 返回数据扩展
+            return_model (bool): 是否返回 Pydantic 模型，默认 True
 
         Returns:
-            dict: 包含行政区划信息的字典
-                {
-                    "districts": [
-                        {
-                            "adcode": "110000",
-                            "name": "北京市",
-                            "center": "116.405285,39.904989",
-                            "level": "province",
-                            "districts": [...]
-                        }
-                    ]
-                }
+            如果 return_model=True: AmapDistrict
+            如果 return_model=False: dict
         """
         logger.info("District query: keywords=%s, subdistrict=%d", keywords, subdistrict)
         params = {
@@ -691,29 +946,24 @@ class GaodeMapClient:
         }
         if keywords:
             params["keywords"] = keywords
-        return self._make_request("/v3/config/district", params)
+        data = self._make_request("/v3/config/district", params)
 
-    # ======================
-    # IP 定位
-    # ======================
+        if return_model:
+            districts = data.get("districts", [])
+            if districts:
+                return AmapDistrict.from_amap_district(districts[0])
+            return AmapDistrict(adcode="", name="")
+        return data
 
     def ip_location(self, ip: Optional[str] = None) -> Dict[str, Any]:
         """
         IP 定位
 
-        文档: https://lbs.amap.com/api/webservice/guide/api/ipconfig
-
         Args:
-            ip (str, optional): IP 地址，不传则使用请求者的 IP
+            ip (str, optional): IP 地址
 
         Returns:
-            dict: 包含 IP 定位结果的字典
-                {
-                    "province": "北京",
-                    "city": "北京市",
-                    "adcode": "110000",
-                    "rectangle": "116.0119343,39.6612767;116.7829835,40.2164962"
-                }
+            dict: IP 定位结果
         """
         logger.info("IP location query: ip=%s", ip or "auto")
         params = {}
@@ -721,22 +971,16 @@ class GaodeMapClient:
             params["ip"] = ip
         return self._make_request("/v3/ip", params)
 
-    # ======================
-    # 天气查询
-    # ======================
-
     def weather(self, city: str, extensions: str = "base") -> Dict[str, Any]:
         """
         天气查询
 
-        文档: https://lbs.amap.com/api/webservice/guide/api/weatherinfo
-
         Args:
             city (str): 城市名称或 adcode
-            extensions (str): 返回数据扩展。"base"（实况天气）或 "all"（预报天气）
+            extensions (str): 返回数据扩展
 
         Returns:
-            dict: 包含天气信息的字典
+            dict: 天气信息
         """
         logger.info("Weather query: city=%s, extensions=%s", city, extensions)
         params = {
@@ -745,25 +989,24 @@ class GaodeMapClient:
         }
         return self._make_request("/v3/weather/weatherInfo", params)
 
-    # ======================
-    # 输入提示
-    # ======================
-
-    def input_tips(self, keywords: str, city: Optional[str] = None,
-                   citylimit: bool = False, datatype: str = "all") -> Dict[str, Any]:
+    def input_tips(
+        self,
+        keywords: str,
+        city: Optional[str] = None,
+        citylimit: bool = False,
+        datatype: str = "all"
+    ) -> Dict[str, Any]:
         """
         输入提示（自动补全）
-
-        文档: https://lbs.amap.com/api/webservice/guide/api/inputtips
 
         Args:
             keywords (str): 查询关键字
             city (str, optional): 查询城市
             citylimit (bool): 是否限制城市范围内
-            datatype (str): 数据类型。"all" 或 "poi"
+            datatype (str): 数据类型
 
         Returns:
-            dict: 包含输入提示结果的字典
+            dict: 输入提示结果
         """
         logger.info("Input tips: keywords=%s, city=%s", keywords, city)
         params = {
@@ -776,57 +1019,25 @@ class GaodeMapClient:
         return self._make_request("/v3/assistant/inputtips", params)
 
 
-# ======================
-# 使用示例
-# ======================
 if __name__ == "__main__":
-    API_KEY = "your_amap_api_key_here"
-
-    client = GaodeMapClient(API_KEY)
-
-    try:
-        print("1. 地理编码:")
-        geo_result = client.geocode("北京市朝阳区望京SOHO")
-        print(json.dumps(geo_result, indent=2, ensure_ascii=False))
-
-        location = geo_result["geocodes"][0]["location"]
-
-        print("\n2. 逆地理编码:")
-        regeo_result = client.reverse_geocode(location, extensions="all")
-        print(json.dumps(regeo_result, indent=2, ensure_ascii=False))
-
-        print("\n3. 驾车路径规划:")
-        drive_result = client.driving_direction(
-            origin=location,
-            destination="116.386837,39.863673"
-        )
-        print(f"预计驾车时长: {drive_result['route']['paths'][0]['duration']} 秒")
-
-        print("\n4. 关键字搜索 POI:")
-        poi_result = client.poi_search_by_keyword(
-            keywords="咖啡厅",
-            types="060100",
-            city="北京",
-            offset=5
-        )
-        for poi in poi_result["pois"][:3]:
-            print(f"- {poi['name']}: {poi['address']}")
-
-        print("\n5. 距离测量:")
-        dist_result = client.distance(
-            origins=location,
-            destination="116.386837,39.863673",
-            distance_type=DistanceType.DRIVING
-        )
-        print(f"距离: {dist_result['results'][0]['distance']} 米")
-
-        print("\n6. 行政区划查询:")
-        district_result = client.district_query("北京", subdistrict=1)
-        print(f"北京市中心: {district_result['districts'][0]['center']}")
-
-    except GaodeMapAPIError as e:
-        print(f"API 错误: {e.message} (code: {e.info_code})")
-    except GaodeMapConnectionError as e:
-        print(f"连接错误: {e.message}")
-    except Exception as e:
-        print(f"未知错误: {e}")
+    print("=" * 60)
+    print("高德地图 API SDK 使用示例")
+    print("=" * 60)
+    print()
+    print("请设置环境变量 AMAP_API_KEY 或在代码中传入 api_key 参数:")
+    print()
+    print("方式一: 环境变量")
+    print("  export AMAP_API_KEY='your_api_key_here'  # Linux/Mac")
+    print("  set AMAP_API_KEY=your_api_key_here       # Windows")
+    print()
+    print("方式二: 代码传入")
+    print("  from gaodeapi import GaodeMapClient")
+    print("  client = GaodeMapClient(api_key='your_api_key_here')")
+    print()
+    print("方式三: 使用配置对象")
+    print("  from gaodeapi.models import AmapConfig")
+    print("  from gaodeapi import GaodeMapClient")
+    print("  config = AmapConfig(api_key='your_api_key_here', timeout=30)")
+    print("  client = GaodeMapClient(config=config)")
+    print()
+    print("=" * 60)
