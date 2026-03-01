@@ -1,6 +1,10 @@
 """
 组件: 行程动态调整模块
 
+TODO: 此模块已在 main.py 中被引用但功能需要完善
+- 当前状态: 已在 main.py 中初始化但未完全集成到流程中
+- 建议: 完成与 MaplanaviPipeline 的集成
+
 核心职责:
 - POI替换功能 (swap_poi)
 - POI删除功能 (skip_poi)

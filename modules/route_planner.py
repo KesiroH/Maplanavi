@@ -27,6 +27,15 @@ except ImportError:
     logger.warning("numpy not available, using simplified K-Means implementation")
 
 
+def _get_insufficient_poi_error():
+    """延迟导入避免循环依赖"""
+    from common.exceptions import InsufficientPOIError
+    return InsufficientPOIError
+
+MIN_POI_FOR_CLUSTERING = 3
+MIN_POI_FOR_PLANNING = 2
+
+
 class GeoClusterer:
     """地理聚类器 - 按时段对POI进行分组"""
     
@@ -911,6 +920,19 @@ class RoutePlanner:
         distribution = distribution or self.default_distribution
         
         logger.info(f"Starting route planning for {len(pois)} POIs")
+        
+        if len(pois) < MIN_POI_FOR_PLANNING:
+            InsufficientPOIError = _get_insufficient_poi_error()
+            raise InsufficientPOIError.from_poi_count(
+                available=len(pois),
+                required=MIN_POI_FOR_PLANNING
+            )
+        
+        if len(pois) < MIN_POI_FOR_CLUSTERING:
+            logger.warning(
+                f"POI数量 ({len(pois)}) 少于最小聚类要求 ({MIN_POI_FOR_CLUSTERING})，"
+                "将跳过聚类步骤"
+            )
         
         self.clusterer.fit(pois)
         

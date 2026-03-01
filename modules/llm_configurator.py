@@ -9,14 +9,34 @@
 支持的LLM:
 - OpenAI (gpt-4o, gpt-4-turbo, gpt-3.5-turbo)
 - 通义千问 (qwen-max, qwen-plus, qwen-turbo)
+- 火山方舟/豆包 (doubao-seed-2.0-pro, doubao-1.5-pro-32k 等)
 """
 
 from __future__ import annotations
 import logging
 import json
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, Union
+
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type
+)
 
 logger = logging.getLogger(__name__)
+
+VOLCENGINE_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
+
+
+def is_retryable_error(exception: Exception) -> bool:
+    """判断错误是否可重试"""
+    error_msg = str(exception).lower()
+    retryable_keywords = [
+        'timeout', 'connection', 'reset', 'temporary',
+        'rate limit', '429', '500', '502', '503', '504'
+    ]
+    return any(keyword in error_msg for keyword in retryable_keywords)
 
 
 class LLMConfigurator:
@@ -31,20 +51,30 @@ class LLMConfigurator:
         self.api_key = config['api_key']
         self.model = config['model']
         self.base_url = config.get('base_url')
-        self.timeout = config.get('timeout', 30)
+        self.timeout = config.get('timeout', 15)  # 缩短超时时间
         self.temperature = config.get('temperature', 0.3)
         self.max_tokens = config.get('max_tokens', 2000)
-        self.retry = config.get('retry', 2)
+        self.retry = config.get('retry', 1)  # 减少重试次数
+        self.thinking_enabled = config.get('thinking_enabled', False)
+        self.client = None
+        
         self.is_tongyi_intl = (
             self.llm_type == "tongyi" and 
             self.base_url and 
             "dashscope-intl" in self.base_url
         )
         
-        # 初始化客户端
+        self.is_volcengine = self.llm_type in ("volcengine", "doubao", "ark")
+        
+        if self.is_volcengine and not self.base_url:
+            self.base_url = VOLCENGINE_BASE_URL
+        
         self.client = self._init_client()
         
-        logger.info(f"✅ LLM初始化成功: {self.llm_type} / {self.model}")
+        if self.client is not None:
+            logger.info(f"✅ LLM初始化成功: {self.llm_type} / {self.model}")
+        else:
+            logger.warning("⚠️ LLM 客户端初始化失败，将跳过 LLM 相关功能")
     
     def _init_client(self):
         """初始化LLM客户端"""
@@ -54,8 +84,10 @@ class LLMConfigurator:
             if self.is_tongyi_intl:
                 return self._init_tongyi_intl()
             return self._init_tongyi()
+        elif self.is_volcengine:
+            return self._init_volcengine()
         else:
-            raise ValueError(f"不支持的LLM类型: {self.llm_type}")
+            raise ValueError(f"不支持的LLM类型: {self.llm_type}。支持的类型: openai, tongyi, volcengine/doubao")
     
     def _init_openai(self):
         """初始化OpenAI客户端"""
@@ -116,14 +148,12 @@ class LLMConfigurator:
         try:
             from openai import OpenAI
             
-            # ⭐ 使用 OpenAI SDK 连接通义国际版
             client = OpenAI(
                 api_key=self.api_key,
                 base_url=self.base_url,
                 timeout=self.timeout
             )
             
-            # 测试连接
             logger.debug("测试通义千问国际版连接...")
             response = client.chat.completions.create(
                 model=self.model,
@@ -138,6 +168,49 @@ class LLMConfigurator:
             raise ImportError("请安装OpenAI SDK: pip install openai>=1.0.0")
         except Exception as e:
             raise RuntimeError(f"通义千问国际版初始化失败: {e}")
+    
+    def _init_volcengine(self):
+        """
+        初始化火山方舟/豆包客户端（OpenAI兼容模式）
+        
+        火山方舟API文档: https://www.volcengine.com/docs/82379/1330310
+        API端点: https://ark.cn-beijing.volces.com/api/v3/chat/completions
+        
+        支持的模型:
+        - doubao-seed-2.0-pro: 旗舰级Agent通用模型，支持深度思考
+        - doubao-seed-2.0-lite: 轻量版模型
+        - doubao-seed-2.0-mini: 迷你版模型
+        - doubao-1.5-pro-32k: 标准版模型
+        - doubao-1.5-lite-32k: 轻量版模型
+        """
+        try:
+            from openai import OpenAI
+            
+            client = OpenAI(
+                api_key=self.api_key,
+                base_url=self.base_url,
+                timeout=self.timeout
+            )
+            
+            logger.debug(f"测试火山方舟连接: {self.base_url}")
+            response = client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=10
+            )
+            
+            logger.info(f"✅ 火山方舟连接成功: {self.model}")
+            return client
+            
+        except ImportError:
+            raise ImportError("请安装OpenAI SDK: pip install openai>=1.0.0")
+        except Exception as e:
+            error_msg = str(e)
+            if "401" in error_msg or "Unauthorized" in error_msg:
+                logger.warning(f"⚠️ 火山方舟 API Key 认证失败: {error_msg}")
+                logger.warning("将跳过 LLM 评分功能，程序将继续运行")
+                return None
+            raise RuntimeError(f"火山方舟初始化失败: {e}")
 
     # ===========================
     # 统一调用接口
@@ -145,7 +218,7 @@ class LLMConfigurator:
     
     def call_json(
         self,
-        user_prompt: str,
+        user_prompt: Union[str, List[Dict]],  # 支持字符串或多模态消息列表
         system_prompt: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None
@@ -166,12 +239,15 @@ class LLMConfigurator:
             ValueError: JSON解析失败
             RuntimeError: API调用失败
         """
+        if self.client is None:
+            raise RuntimeError("LLM 客户端未初始化，请检查 API Key 配置")
+        
         # 使用配置的默认值
         temperature = temperature if temperature is not None else self.temperature
         max_tokens = max_tokens if max_tokens is not None else self.max_tokens
         
         # 根据LLM类型调用不同方法
-        if self.llm_type == "openai" or self.is_tongyi_intl:
+        if self.llm_type == "openai" or self.is_tongyi_intl or self.is_volcengine:
             response = self._call_openai_json(
                 user_prompt, system_prompt, temperature, max_tokens
             )
@@ -186,7 +262,7 @@ class LLMConfigurator:
     
     def call_text(
         self,
-        user_prompt: str,
+        user_prompt: Union[str, List[Dict]],  # 支持字符串或多模态消息列表
         system_prompt: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None
@@ -200,10 +276,13 @@ class LLMConfigurator:
         Returns:
             文本响应
         """
+        if self.client is None:
+            raise RuntimeError("LLM 客户端未初始化，请检查 API Key 配置")
+        
         temperature = temperature if temperature is not None else self.temperature
         max_tokens = max_tokens if max_tokens is not None else self.max_tokens
         
-        if self.llm_type == "openai" or self.is_tongyi_intl:
+        if self.llm_type == "openai" or self.is_tongyi_intl or self.is_volcengine:
             response = self._call_openai_text(
                 user_prompt, system_prompt, temperature, max_tokens
             )
@@ -217,17 +296,23 @@ class LLMConfigurator:
         return response
     
     # ===========================
-    # OpenAI实现(or 通义国际版)
+    # OpenAI实现(or 通义国际版/火山方舟)
     # ===========================
     
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(Exception),
+        reraise=True
+    )
     def _call_openai_json(
         self,
-        user_prompt: str,
+        user_prompt: Union[str, List[Dict]],
         system_prompt: Optional[str],
         temperature: float,
         max_tokens: int
     ) -> Dict[str, Any]:
-        """OpenAI JSON模式调用"""
+        """OpenAI JSON模式调用（支持火山方舟）"""
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -241,12 +326,23 @@ class LLMConfigurator:
                     "temperature": temperature,
                     "max_tokens": max_tokens
                 }
-                if not self.is_tongyi_intl:
+                
+                if self.is_volcengine:
+                    if system_prompt:
+                        messages[0]["content"] += "\n\n请严格返回有效的JSON格式，不要包含任何其他文本或markdown标记。"
+                    else:
+                        messages.insert(0, {
+                            "role": "system",
+                            "content": "请严格返回有效的JSON格式，不要包含任何其他文本或markdown标记。"
+                        })
+                    
+                    if self.thinking_enabled:
+                        kwargs["thinking"] = {"type": "enabled"}
+                elif not self.is_tongyi_intl:
                     kwargs["response_format"] = {"type": "json_object"}
                 else:
-                    # 通义国际版：在 system prompt 中要求 JSON
                     if system_prompt:
-                        messages[0]["content"] += "\n\n⚠️ 请严格返回有效的JSON格式，不要包含任何其他文本或markdown标记。"
+                        messages[0]["content"] += "\n\n请严格返回有效的JSON格式，不要包含任何其他文本或markdown标记。"
                     else:
                         messages.insert(0, {
                             "role": "system",
@@ -256,7 +352,6 @@ class LLMConfigurator:
                 response = self.client.chat.completions.create(**kwargs)
                 content = response.choices[0].message.content
                 
-                # 清理可能的 Markdown 代码块
                 content = content.strip()
                 if content.startswith("```json"):
                     content = content[7:]
@@ -274,18 +369,24 @@ class LLMConfigurator:
                     raise ValueError(f"LLM返回非有效JSON: {content[:200]}")
             
             except Exception as e:
-                logger.error(f"OpenAI调用失败 (尝试{attempt+1}/{self.retry+1}): {e}")
+                logger.error(f"API调用失败 (尝试{attempt+1}/{self.retry+1}): {e}")
                 if attempt == self.retry:
-                    raise RuntimeError(f"OpenAI API调用失败: {e}")
+                    raise RuntimeError(f"API调用失败: {e}")
     
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(Exception),
+        reraise=True
+    )
     def _call_openai_text(
         self,
-        user_prompt: str,
+        user_prompt: Union[str, List[Dict]],
         system_prompt: Optional[str],
         temperature: float,
         max_tokens: int
     ) -> str:
-        """OpenAI文本模式调用"""
+        """OpenAI文本模式调用（支持火山方舟深度思考）"""
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -293,19 +394,24 @@ class LLMConfigurator:
         
         for attempt in range(self.retry + 1):
             try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens
-                )
+                kwargs = {
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens
+                }
+                
+                if self.is_volcengine and self.thinking_enabled:
+                    kwargs["thinking"] = {"type": "enabled"}
+                
+                response = self.client.chat.completions.create(**kwargs)
                 
                 return response.choices[0].message.content
                 
             except Exception as e:
-                logger.error(f"OpenAI调用失败 (尝试{attempt+1}/{self.retry+1}): {e}")
+                logger.error(f"API调用失败 (尝试{attempt+1}/{self.retry+1}): {e}")
                 if attempt == self.retry:
-                    raise RuntimeError(f"OpenAI API调用失败: {e}")
+                    raise RuntimeError(f"API调用失败: {e}")
     
     # ===========================
     # 通义千问实现

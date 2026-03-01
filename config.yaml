@@ -1,0 +1,60 @@
+# 高德地图 API 配置
+amap:
+  api_key: ${AMAP_API_KEY}  # 从环境变量读取
+  timeout: 10
+  max_retries: 3
+  retry_delay: 1.0
+
+# LLM 配置
+# 支持三种类型: openai, tongyi, volcengine(火山方舟/豆包)
+llm:
+  type: doubao  # openai / tongyi / volcengine / doubao
+  
+  # API Key (必需)
+  api_key: ${VOLCENGINE_API_KEY}  # 火山方舟 API Key
+  
+  # 模型ID (必需)
+  # 火山方舟推荐模型:
+  # - doubao-seed-2.0-pro: 旗舰级Agent通用模型，支持深度思考
+  # - doubao-seed-2.0-lite: 轻量版模型
+  # - doubao-seed-2.0-mini: 迷你版模型
+  # - doubao-1.5-pro-32k: 标准版模型
+  # - doubao-1.5-lite-32k: 轻量版模型
+  model: doubao-seed-2-0-mini-260215  # 官网示例中使用的模型doubao-seed-2-0-mini-260215
+  
+  # API端点 (可选，火山方舟默认使用下方地址)
+  base_url: https://ark.cn-beijing.volces.com/api/v3
+  
+  # 深度思考模式 (可选，仅部分模型支持)
+  # doubao-seed-2.0-pro, doubao-seed-1.8 等模型支持
+  thinking_enabled: false
+  
+  # 生成参数
+  temperature: 0.3
+  max_tokens: 2000
+  retry: 2
+
+# 用户配置文件路径
+user_profile:
+  path: modules/user.json
+
+# POI 数据配置
+poi:
+  data_path: haidian_poi.json
+  categories_path: poi_categories.json
+  max_distance_km: 10.0
+
+# 评分权重配置
+scoring:
+  weights:
+    llm_relevance: 0.5
+    amap_rating: 0.3
+    distance_decay: 0.2
+
+# 输出配置
+output:
+  path: output
+  formats:
+    - json
+    - csv
+  encoding: utf-8

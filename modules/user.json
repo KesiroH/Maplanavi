@@ -1,49 +1,43 @@
 {
   "meta": {
-    "user_id": "u_12345",
-    "session_id": "s_67890",
-    "created_at": "2026-02-12T10:00:00"
+    "user_id": "u_20260302002340",
+    "session_id": "s_20260302002340",
+    "created_at": "2026-03-02T00:23:40.717212"
   },
   "hard_constraints": {
-    "date": "2026-05-01",
+    "date": "2026-03-03",
     "duration_days": 1,
     "start_point": {
       "name": "五道口地铁站",
-      "location": [116.338, 39.993] 
+      "location": [
+        116.397,
+        39.909
+      ]
     },
-    "end_point": { 
+    "end_point": {
       "type": "same_as_start"
     },
-    "transport_mode": "driving", 
+    "transport_mode": "mixed",
     "distribution": {
-      "morning": 2,  
-      "afternoon": 2, 
-      "evening": 1   
+      "morning": 1,
+      "afternoon": 1,
+      "evening": 1
     }
   },
   "soft_preferences": {
-    "pace": "relaxed", 
-    "budget_level": 3, 
+    "pace": "relaxed",
+    "budget_level": 4,
     "interests": [
       {
         "type": "sight",
-        "level": "strict", 
+        "level": "preferred",
         "category_constraint": {
-           "major": "110000", 
-           "middle": "110100", 
-           "specific_name": null 
-        }
-      },
-      {
-        "type": "dining",
-        "meal": "lunch",
-        "category_constraint": {
-           "major": "050000",
-           "middle": "050100", 
-           "small": "050102"   
+          "major": "110000",
+          "middle": "110100",
+          "small": "110104"
         }
       }
     ],
-    "negative_keywords": ["博物馆", "爬山"] 
+    "negative_keywords": []
   }
 }
