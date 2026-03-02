@@ -39,14 +39,28 @@ setup_logger('maplanavi', level=logging.INFO)
 logger = logging.getLogger('maplanavi')
 
 
+def _expand_env_vars(value):
+    """递归展开配置中的环境变量"""
+    if isinstance(value, str):
+        if value.startswith('${') and value.endswith('}'):
+            env_var = value[2:-1]
+            return os.getenv(env_var, '')
+        return value
+    elif isinstance(value, dict):
+        return {k: _expand_env_vars(v) for k, v in value.items()}
+    elif isinstance(value, list):
+        return [_expand_env_vars(item) for item in value]
+    return value
+
+
 def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     """
     加载配置文件
     
     优先级:
-    1. 指定的配置文件路径
-    2. 当前目录下的 config.yaml
-    3. 环境变量
+    1. config.yaml 文件配置（最高优先级）
+    2. 环境变量覆盖（仅当 config.yaml 中使用 ${VAR} 语法时）
+    3. 硬编码默认值（最低优先级，仅作为兜底）
     
     Args:
         config_path: 配置文件路径（可选）
@@ -54,100 +68,62 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     Returns:
         配置字典
     """
-    llm_api_key = (
-        os.getenv('LLM_API_KEY') or 
-        os.getenv('VOLCENGINE_API_KEY') or 
-        os.getenv('ARK_API_KEY') or  # 火山方舟官网使用的环境变量名
-        os.getenv('OPENAI_API_KEY') or 
-        os.getenv('DASHSCOPE_API_KEY') or 
-        ''
-    )
+    config = {}
     
-    llm_type = os.getenv('LLM_TYPE', 'volcengine')
-    if llm_type not in ('openai', 'tongyi', 'volcengine', 'doubao', 'ark'):
-        if os.getenv('VOLCENGINE_API_KEY'):
-            llm_type = 'volcengine'
-        elif os.getenv('OPENAI_API_KEY'):
-            llm_type = 'openai'
-        elif os.getenv('DASHSCOPE_API_KEY'):
-            llm_type = 'tongyi'
+    default_config_path = Path(__file__).parent / 'config.yaml'
+    config_file_to_load = config_path if config_path and Path(config_path).exists() else default_config_path
     
-    config = {
-        'amap': {
-            'api_key': os.getenv('AMAP_API_KEY', '')
-        },
-        'llm': {
-            'type': llm_type,
-            'api_key': llm_api_key,
-            'model': os.getenv('LLM_MODEL', 'doubao-1.5-pro-32k'),
-            'base_url': os.getenv('LLM_BASE_URL', None),
-            'temperature': float(os.getenv('LLM_TEMPERATURE', '0.3')),
-            'max_tokens': int(os.getenv('LLM_MAX_TOKENS', '2000')),
-            'retry': int(os.getenv('LLM_RETRY', '2')),
-            'thinking_enabled': os.getenv('THINKING_ENABLED', 'false').lower() == 'true'
-        },
-        'poi': {
-            'data_path': 'haidian_poi.json',
-            'categories_path': 'poi_categories.json'
-        }
-    }
-    
-    if config_path and Path(config_path).exists():
-        logger.info(f"从配置文件加载: {config_path}")
+    if config_file_to_load.exists():
+        logger.info(f"从配置文件加载: {config_file_to_load}")
         try:
             import yaml
-            with open(config_path, 'r', encoding='utf-8') as f:
+            with open(config_file_to_load, 'r', encoding='utf-8') as f:
                 file_config = yaml.safe_load(f)
                 if file_config:
-                    config = _deep_merge(config, file_config)
+                    config = _expand_env_vars(file_config)
         except ImportError:
-            logger.warning("未安装 PyYAML，跳过 YAML 配置文件加载")
+            logger.warning("未安装 PyYAML，使用默认配置")
         except Exception as e:
             logger.warning(f"加载配置文件失败: {e}")
     
-    default_config_path = Path(__file__).parent / 'config.yaml'
-    if default_config_path.exists():
-        logger.info(f"从默认配置文件加载: {default_config_path}")
-        try:
-            import yaml
-            with open(default_config_path, 'r', encoding='utf-8') as f:
-                file_config = yaml.safe_load(f)
-                if file_config:
-                    config = _deep_merge(config, file_config)
-        except ImportError:
-            pass
-        except Exception as e:
-            logger.warning(f"加载默认配置文件失败: {e}")
+    if 'amap' not in config:
+        config['amap'] = {}
+    if not config['amap'].get('api_key'):
+        config['amap']['api_key'] = os.getenv('AMAP_API_KEY', '')
+    
+    if 'llm' not in config:
+        config['llm'] = {}
+    if not config['llm'].get('api_key'):
+        llm_api_key = (
+            os.getenv('LLM_API_KEY') or 
+            os.getenv('VOLCENGINE_API_KEY') or 
+            os.getenv('ARK_API_KEY') or
+            os.getenv('OPENAI_API_KEY') or 
+            os.getenv('DASHSCOPE_API_KEY') or 
+            ''
+        )
+        config['llm']['api_key'] = llm_api_key
+    
+    if 'poi' not in config:
+        config['poi'] = {
+            'data_path': 'haidian_poi.json',
+            'categories_path': 'poi_categories.json'
+        }
     
     return config
-
-
-def _deep_merge(base: Dict, override: Dict) -> Dict:
-    """深度合并两个字典"""
-    result = base.copy()
-    for key, value in override.items():
-        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-            result[key] = _deep_merge(result[key], value)
-        else:
-            result[key] = value
-    return result
 
 
 def init_amap_client(config: Dict[str, Any]) -> GaodeMapClient:
     """
     初始化高德地图客户端
-    
     Args:
         config: 配置字典
-    
     Returns:
         GaodeMapClient 实例
-    
     Raises:
         ValueError: API Key 未配置
     """
     api_key = config.get('amap', {}).get('api_key', '')
-    
     if not api_key:
         api_key = os.getenv('AMAP_API_KEY', '')
     
@@ -172,33 +148,38 @@ def init_llm_client(config: Dict[str, Any]) -> Optional[LLMConfigurator]:
         config: 配置字典
     
     Returns:
-        LLMConfigurator 实例，如果配置不完整则返回 None
+        LLMConfigurator 实例，如果配置不完整或初始化失败则返回 None
     """
     llm_config = config.get('llm', {})
-    
-    api_key = llm_config.get('api_key', '') or os.getenv('LLM_API_KEY', '')
+    api_key = llm_config.get('api_key', '')
     
     if not api_key:
         logger.warning(
             "⚠️ LLM API Key 未配置，将跳过 LLM 评分功能\n"
             "请通过以下方式之一配置:\n"
-            "  1. 设置环境变量: LLM_API_KEY=your_key\n"
-            "  2. 在 config.yaml 中配置 llm.api_key"
+            "  1. 在 config.yaml 中配置 llm.api_key\n"
+            "  2. 设置环境变量: VOLCENGINE_API_KEY 或 OPENAI_API_KEY"
         )
         return None
     
     full_config = {
-        'type': llm_config.get('type', 'openai'),
+        'type': llm_config.get('type', 'doubao'),
         'api_key': api_key,
-        'model': llm_config.get('model', 'gpt-4o'),
+        'model': llm_config.get('model'),
         'base_url': llm_config.get('base_url'),
         'temperature': llm_config.get('temperature', 0.3),
         'max_tokens': llm_config.get('max_tokens', 2000),
-        'retry': llm_config.get('retry', 2)
+        'retry': llm_config.get('retry', 2),
+        'thinking_enabled': llm_config.get('thinking_enabled', False)
     }
     
     try:
         client = LLMConfigurator(full_config)
+        
+        if client.client is None:
+            logger.warning("⚠️ LLM 客户端初始化失败（API Key 可能无效），将跳过 LLM 评分功能")
+            return None
+        
         logger.info(f"✅ LLM 客户端初始化成功: {full_config['type']} / {full_config['model']}")
         return client
     except Exception as e:

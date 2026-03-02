@@ -12,7 +12,7 @@
 - 配置参数
 
 输出:
-- 基础行程方案（8个地点）
+- 基础行程方案
 """
 
 from __future__ import annotations

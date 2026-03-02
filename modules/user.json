@@ -1,14 +1,14 @@
 {
   "meta": {
-    "user_id": "u_20260302002340",
-    "session_id": "s_20260302002340",
-    "created_at": "2026-03-02T00:23:40.717212"
+    "user_id": "u_20260302115425",
+    "session_id": "s_20260302115425",
+    "created_at": "2026-03-02T11:54:25.619152"
   },
   "hard_constraints": {
-    "date": "2026-03-03",
+    "date": "2026-03-04",
     "duration_days": 1,
     "start_point": {
-      "name": "五道口地铁站",
+      "name": "五道口",
       "location": [
         116.397,
         39.909
@@ -26,18 +26,14 @@
   },
   "soft_preferences": {
     "pace": "relaxed",
-    "budget_level": 4,
-    "interests": [
-      {
-        "type": "sight",
-        "level": "preferred",
-        "category_constraint": {
-          "major": "110000",
-          "middle": "110100",
-          "small": "110104"
-        }
-      }
-    ],
-    "negative_keywords": []
+    "budget_level": 1,
+    "interests": [],
+    "negative_keywords": [
+      "商场",
+      "博物馆",
+      "公园",
+      "游乐园",
+      "茶馆商店"
+    ]
   }
 }

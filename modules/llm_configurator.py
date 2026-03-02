@@ -5,24 +5,12 @@
 - 统一管理LLM连接配置
 - 提供可复用的LLM调用接口
 - 支持多模型切换
-
-支持的LLM:
-- OpenAI (gpt-4o, gpt-4-turbo, gpt-3.5-turbo)
-- 通义千问 (qwen-max, qwen-plus, qwen-turbo)
-- 火山方舟/豆包 (doubao-seed-2.0-pro, doubao-1.5-pro-32k 等)
 """
 
 from __future__ import annotations
 import logging
 import json
 from typing import Dict, Optional, Any, Union
-
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception_type
-)
 
 logger = logging.getLogger(__name__)
 
@@ -51,10 +39,10 @@ class LLMConfigurator:
         self.api_key = config['api_key']
         self.model = config['model']
         self.base_url = config.get('base_url')
-        self.timeout = config.get('timeout', 15)  # 缩短超时时间
+        self.timeout = config.get('timeout', 60)
         self.temperature = config.get('temperature', 0.3)
         self.max_tokens = config.get('max_tokens', 2000)
-        self.retry = config.get('retry', 1)  # 减少重试次数
+        self.retry = config.get('retry', 2)
         self.thinking_enabled = config.get('thinking_enabled', False)
         self.client = None
         
@@ -299,12 +287,6 @@ class LLMConfigurator:
     # OpenAI实现(or 通义国际版/火山方舟)
     # ===========================
     
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type(Exception),
-        reraise=True
-    )
     def _call_openai_json(
         self,
         user_prompt: Union[str, List[Dict]],
@@ -318,7 +300,8 @@ class LLMConfigurator:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": user_prompt})
         
-        for attempt in range(self.retry + 1):
+        max_attempts = self.retry + 1
+        for attempt in range(max_attempts):
             try:
                 kwargs = {
                     "model": self.model,
@@ -364,21 +347,15 @@ class LLMConfigurator:
                 return json.loads(content)
                 
             except json.JSONDecodeError as e:
-                logger.error(f"JSON解析失败 (尝试{attempt+1}/{self.retry+1}): {e}")
+                logger.error(f"JSON解析失败 (尝试{attempt+1}/{max_attempts}): {e}")
                 if attempt == self.retry:
                     raise ValueError(f"LLM返回非有效JSON: {content[:200]}")
             
             except Exception as e:
-                logger.error(f"API调用失败 (尝试{attempt+1}/{self.retry+1}): {e}")
+                logger.error(f"API调用失败 (尝试{attempt+1}/{max_attempts}): {e}")
                 if attempt == self.retry:
                     raise RuntimeError(f"API调用失败: {e}")
     
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type(Exception),
-        reraise=True
-    )
     def _call_openai_text(
         self,
         user_prompt: Union[str, List[Dict]],
@@ -392,7 +369,8 @@ class LLMConfigurator:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": user_prompt})
         
-        for attempt in range(self.retry + 1):
+        max_attempts = self.retry + 1
+        for attempt in range(max_attempts):
             try:
                 kwargs = {
                     "model": self.model,
@@ -409,7 +387,7 @@ class LLMConfigurator:
                 return response.choices[0].message.content
                 
             except Exception as e:
-                logger.error(f"API调用失败 (尝试{attempt+1}/{self.retry+1}): {e}")
+                logger.error(f"API调用失败 (尝试{attempt+1}/{max_attempts}): {e}")
                 if attempt == self.retry:
                     raise RuntimeError(f"API调用失败: {e}")
     

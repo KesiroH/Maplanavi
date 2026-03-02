@@ -6,32 +6,16 @@ amap:
   retry_delay: 1.0
 
 # LLM 配置
-# 支持三种类型: openai, tongyi, volcengine(火山方舟/豆包)
+
 llm:
-  type: doubao  # openai / tongyi / volcengine / doubao
-  
-  # API Key (必需)
-  api_key: ${VOLCENGINE_API_KEY}  # 火山方舟 API Key
-  
-  # 模型ID (必需)
-  # 火山方舟推荐模型:
-  # - doubao-seed-2.0-pro: 旗舰级Agent通用模型，支持深度思考
-  # - doubao-seed-2.0-lite: 轻量版模型
-  # - doubao-seed-2.0-mini: 迷你版模型
-  # - doubao-1.5-pro-32k: 标准版模型
-  # - doubao-1.5-lite-32k: 轻量版模型
-  model: doubao-seed-2-0-mini-260215  # 官网示例中使用的模型doubao-seed-2-0-mini-260215
-  
-  # API端点 (可选，火山方舟默认使用下方地址)
+  type: doubao  
+  api_key: ${VOLCENGINE_API_KEY}  
+  model: doubao-seed-2-0-mini-260215 
   base_url: https://ark.cn-beijing.volces.com/api/v3
-  
-  # 深度思考模式 (可选，仅部分模型支持)
-  # doubao-seed-2.0-pro, doubao-seed-1.8 等模型支持
+  timeout: 90
   thinking_enabled: false
-  
-  # 生成参数
   temperature: 0.3
-  max_tokens: 2000
+  max_tokens: 50000
   retry: 2
 
 # 用户配置文件路径

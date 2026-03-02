@@ -7,11 +7,9 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Any, Tuple
 from pydantic import BaseModel, Field, validator
 from datetime import datetime
-
 # =========================
 # 基础数据模型
 # =========================
-
 class RawPOI(BaseModel):
     """原始POI数据（来自Overpass）"""
     osm_type: str  # node / way / relation
